@@ -1,6 +1,6 @@
+from functools import reduce
 import bpy
 import struct
-import math
 
 # Header format string
 # https://docs.python.org/3.5/library/struct.html#struct.pack
@@ -15,6 +15,99 @@ attrib_fmt = "<2B2Q"
 def c_str(s, encoding = "ascii"):
     return struct.pack("<" + str(len(s) + 1) + "s", s.encode(encoding))
 
+# find all the uv coords used by each vertex, and which loops use which uvs
+# return a tuple of lists
+# the first list contains a list per mesh vertex, whose items are a tuple containing
+# a uv coordinate and a list of loop indices for that uv
+# the second list contains an index per loop, of which uv it uses for its corresponding vertex
+def map_vertex_uvs(mesh, uv_layer):
+    vertex_uv_lists = [[] for _ in mesh.vertices]
+    loop_uv_inds = [0] * len(mesh.loops)
+    for loop, uv_loop in zip(mesh.loops, uv_layer.data):
+        uv_list = vertex_uv_lists[loop.vertex_index]
+        c_uv = uv_loop.uv
+        found = False
+        for i in range(len(uv_list)):
+            (uv, loop_inds) = uv_list[i]
+            if (c_uv - uv).length < 0.001:
+                found = True
+                loop_uv_inds[loop.index] = i
+                loop_inds.append(loop.index)
+                break
+        if not found:
+            loop_uv_inds[loop.index] = len(uv_list)
+            uv_list.append((c_uv, [loop.index]))
+    return (vertex_uv_lists, loop_uv_inds)
+
+# find all normals for each vertex, and which loops use which normals
+# returns similar info to above, except for normals rather than uvs
+# this method handles smooth and flat shading per polygon
+# if only smooth shading is used, every normal will just be the vertex normal
+def map_vertex_normals(mesh):
+    # list containing lists of tuples of vertex normals and list of indices for that normal
+    # for each vertex 
+    vertex_normals_list = [[] for _ in mesh.vertices]
+    loop_normal_inds = [0] * len(mesh.loops)
+    for poly in mesh.polygons:
+        # use polygon normal if flat shaded otherwise use vertex normal
+        normals = ([poly.normal] * len(poly.loop_indices) if not poly.use_smooth else
+            [mesh.vertices[v].normal for v in [mesh.loops[i].vertex_index for i in poly.loop_indices]])
+
+        # iterate both the normals and loops that make up this polygon
+        for (c_n, loop) in zip(normals, [mesh.loops[i] for i in poly.loop_indices]):
+            normals_list = vertex_normals_list[loop.vertex_index]
+            # try to find if this normal is in the list of normals for this vertex already
+            found = False
+            for i in range(len(normals_list)):
+                (n, loop_inds) = normals_list[i]
+                if (c_n - n).length < 0.001:
+                    # if found, add this loop index to the list
+                    found = True
+                    loop_normal_inds[loop.index] = i
+                    loop_inds.append(loop.index)
+                    break
+            # if not found, add an item to the list for this normal and loop
+            if not found:
+                loop_normal_inds[loop.index] = len(normals_list)
+                normals_list.append((c_n, [loop.index]))
+    
+    return (vertex_normals_list, loop_normal_inds)
+
+# compute and enumerate the combinations of uv and normal for each vertex in the mesh
+# also compute the index into the final vertex loop for each loop in the mesh
+#
+# returns a tuple containing two lists and the total output vertex (permutation) count
+#
+# the first list contains for each vertex a list of tuples, which in turn contain
+# the index into the final vertex list for this permutation, and the indices of the uv and
+# normal used by this permutation each as numbers in the range of 0 until the count of either
+# uvs or normals for this vertex, so they can index into the per-vertex lists returned by
+# the map_* functions above
+#
+# the second list contains the index for each loop of the loop's vertex permutation, i.e.
+# the vertex index we need to write for this loop
+def find_vertex_permutations(mesh, loop_uv_inds, loop_normal_inds):
+    # figure out which combinations of vertex uvs and normals we need to export
+    # also figure out what the indices will be since the info we need is all here
+    vertex_permutations = [[] for _ in mesh.vertices]
+    loop_inds = [0] * len(mesh.loops)
+    c_index = 0
+    for (loop, c_uv_ind, c_normal_ind) in zip(mesh.loops, loop_uv_inds, loop_normal_inds):
+        found = False
+        perms = vertex_permutations[loop.vertex_index]
+        for i in range(len(perms)):
+            (ind, uv_ind, normal_ind) = perms[i]
+            if c_uv_ind == uv_ind and c_normal_ind == normal_ind:
+                found = True
+                loop_inds[loop.index] = ind
+        if not found:
+            perms.append((c_index, c_uv_ind, c_normal_ind))
+            loop_inds[loop.index] = c_index
+            c_index += 1
+
+    return (vertex_permutations, loop_inds, c_index)
+
+
 def export_mesh(object, filename):
     print("Exporting mesh to: " + filename)
     mesh = object.data
@@ -27,69 +120,46 @@ def export_mesh(object, filename):
         # as well as choosing a particular uv layer for export
         uv_layer = mesh.uv_layers[0] if mesh.uv_layers else None
         
-        # you know what, I think for now lets just assume we are writing
-        # texcoords, positions, and normals
-        
-        # the vertex position and normal are right there in the vertex info
-        # the uv is a bit trickier, it's stored in a uv_layer where each element
-        # in its data has a uv and vertex index, theoretically (and in fact),
-        # multiple uv loop items may exist for a given vertex. some of those
-        # items may have the same uv coordinate
+        # for now lets just assume we are writing texcoords, positions, and normals
         
         # calculate triangulation
         if not mesh.loop_triangles:
             mesh.calc_loop_triangles()
-            
-        uv_list_list = [ [] for i in range(len(mesh.vertices)) ]
-        
-        vertex_count = 0
-        for loop_item, uv_item in zip(mesh.loops, uv_layer.data):
-                l = uv_list_list[loop_item.vertex_index]
-                c_uv = uv_item.uv
-                found = False
-                for (loop_inds, uv) in l:
-                    if abs(uv.x - c_uv.x) < 0.0001 and abs(uv.y - c_uv.y) < 0.0001:
-                        found = True
-                        loop_inds.append(loop_item.index)
-                        break
-                if not found:
-                    ++vertex_count
-                    uv_list_list[loop_item.vertex_index].append(([loop_item.index], c_uv))
-        
-        vertices = []
-        loop_vert_inds = [-1] * len(mesh.loops)
-        for i in range(len(uv_list_list)):
-            for (loop_inds, uv) in uv_list_list[i]:
-                for index in loop_inds:
-                    loop_vert_inds[index] = len(vertices)
-                vertex = mesh.vertices[i]
-                vertices.append((
-                    vertex.co,
-                    vertex.normal,
-                    uv))
-            
-        triangle_vert_inds = [0] * 3 * len(mesh.loop_triangles)
-        for i in range(len(mesh.loop_triangles)):
-            tri = mesh.loop_triangles[i]
-            positions = [mesh.vertices[i].co for i in tri.vertices]
-            normal = (positions[1] - positions[0]).cross(positions[2] - positions[1])
-            loop_inds = tri.loops
-            if normal.dot(tri.normal) < 0.0:
-                loop_inds[1], loop_inds[2] = loop_inds[2], loop_inds[1]
-            for j in range(3):
-                triangle_vert_inds[3 * i + j] = loop_vert_inds[loop_inds[j]]
+
+        # get all info needed to write vertex permutations
+        # permutations of position, normal, and uv per mesh vertex that is
+        # each needs to be exported as a separate vertex, but we still don't want duplicates
+        # so we do some computation
+        (vertex_uvs, loop_uv_inds) = map_vertex_uvs(mesh, uv_layer)
+        (vertex_normals, loop_normal_inds) = map_vertex_normals(mesh)
+        (vertex_perms, loop_inds, num_vertices) = find_vertex_permutations(mesh, loop_uv_inds, loop_normal_inds)
+
+        # get the loop indices in the proper number and order for triangulation
+        # iterate over each triangle and get the permutation index of each loop
+        # concatenating the lists as we go
+        tri_inds = reduce(list.__add__, [[loop_inds[i] for i in tri.loops] for tri in mesh.loop_triangles], [])
+
+        # compute the actual vertex permutations using the indices we computed
+        vertices = [None] * num_vertices
+        for (vert, perms) in zip(mesh.vertices, vertex_perms):
+            for (ind, uv_ind, normal_ind) in perms:
+                (normal, _) = vertex_normals[vert.index][normal_ind]
+                (uv, _) = vertex_uvs[vert.index][uv_ind]
+                vertices[ind] = (vert.co, normal, uv)
         
         # write header
         header = (
             "meshfile".encode("ascii"),
             3, 
-            len(vertices), 
-            len(triangle_vert_inds))
+            num_vertices, 
+            len(tri_inds))
             
         f.write(struct.pack(header_fmt, *header))
             
         # write attributes
-        # let's do position, normal, uv (in that order, very normal :) )
+        # interleaved as position, normal, uv (in order)
+
+        attrib_names = ["position", "normal", "texCoord"]  # these names are needed for proper readback
         attrib_sizes = []
         attrib_offsets = []
         vertex_size = 0
@@ -100,11 +170,6 @@ def export_mesh(object, filename):
             attrib_offsets.append(vertex_size)
             vertex_size += attrib_sizes[i]
             vertex_fmt += str(num_components) + "f"
-            
-        attrib_names = [
-            "position",
-            "normal",
-            "texCoord"]
             
         for i in range(3):
             name = attrib_names[i]
@@ -124,7 +189,7 @@ def export_mesh(object, filename):
             f.write(struct.pack(vertex_fmt, *components))
             
         # write index buffer
-        f.write(struct.pack("<" + str(len(triangle_vert_inds)) + "I", *triangle_vert_inds))
+        f.write(struct.pack("<" + str(len(tri_inds)) + "I", *tri_inds))
     
     return {'FINISHED'}
 
