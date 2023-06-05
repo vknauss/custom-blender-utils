@@ -1,16 +1,17 @@
 from functools import reduce
 import bpy
 import struct
+from mathutils import Vector
 
 # Header format string
 # https://docs.python.org/3.5/library/struct.html#struct.pack
 # < : little-endian byte order, standard type sizes and no padding
 # 8s : 8-character formatted string (encoded ascii in this case) : "meshfile"
 # B : unsigned char : number of attributes
-# 2Q : 2 unsigned long long (uint64_t) : number of vertices and indices
-header_fmt = "<8sB2Q"
+# 3I : 3 uint32_t : vertex size, vertex count, index count
+header_fmt = "<8sB3I"
 
-attrib_fmt = "<2B2Q"
+attrib_fmt = "<2I"
 
 def c_str(s, encoding = "ascii"):
     return struct.pack("<" + str(len(s) + 1) + "s", s.encode(encoding))
@@ -108,7 +109,7 @@ def find_vertex_permutations(mesh, loop_uv_inds, loop_normal_inds):
     return (vertex_permutations, loop_inds, c_index)
 
 
-def export_mesh(object, filename):
+def export_mesh(object, filename, export_skinning_data):
     print("Exporting mesh to: " + filename)
     mesh = object.data
     with open(filename, "wb") as f:
@@ -140,17 +141,67 @@ def export_mesh(object, filename):
         tri_inds = reduce(list.__add__, [[loop_inds[i] for i in tri.loops] for tri in mesh.loop_triangles], [])
 
         # compute the actual vertex permutations using the indices we computed
-        vertices = [None] * num_vertices
+        positions = [None] * num_vertices
+        normals = [None] * num_vertices
+        uvs = [None] * num_vertices
+        joint_weights = [None] * num_vertices if export_skinning_data else []
+        joint_indices = [None] * num_vertices if export_skinning_data else []
         for (vert, perms) in zip(mesh.vertices, vertex_perms):
+            if export_skinning_data:
+                joint_inds = [0, 0, 0, 0]
+                weights = [0, 0, 0, 0]
+                num_joints = 0
+                for group in vert.groups:
+                    if num_joints < 4:
+                        joint_inds[num_joints] = group.group
+                        weights[num_joints] = group.weight
+                        num_joints += 1
+                    else:
+                        for i in range(num_joints):
+                            if weights[i] < group.weight:
+                                joint_inds[i] = group.group
+                                weights[i] = group.weight
+                                break
+                weight_sum = 0
+                for weight in weights:
+                    weight_sum += weight
+                if weight_sum > 0:
+                    for weight in weights:
+                        weight = weight / weight_sum
+                for (ind, _, _) in perms:
+                    joint_weights[ind] = weights
+                    joint_indices[ind] = joint_inds
+                    
             for (ind, uv_ind, normal_ind) in perms:
                 (normal, _) = vertex_normals[vert.index][normal_ind]
                 (uv, _) = vertex_uvs[vert.index][uv_ind]
-                vertices[ind] = (vert.co, normal, uv)
+                positions[ind] = Vector((-vert.co.x, vert.co.z, vert.co.y))
+                normals[ind] = normal
+                uvs[ind] = uv
+        
+        attrib_infos = [
+            ("position", "<3f", positions),
+            ("normal", "<3f", normals),
+            ("texCoord", "<2f", uvs)]
+        
+        if export_skinning_data:
+            attrib_infos += [
+                ("jointWeights", "<4f", joint_weights),
+                ("jointIndices", "<4B", joint_indices)]
+                
+        attrib_sizes = []
+        attrib_offsets = []
+        vertex_size = 0
+        for (name, format, _) in attrib_infos:
+            attrib_sizes.append(struct.calcsize(format))
+            attrib_offsets.append(vertex_size)
+            vertex_size += attrib_sizes[-1]
         
         # write header
         header = (
             "meshfile".encode("ascii"),
-            3, 
+            len(attrib_infos),
+            vertex_size,
             num_vertices, 
             len(tri_inds))
             
@@ -158,43 +209,26 @@ def export_mesh(object, filename):
             
         # write attributes
         # interleaved as position, normal, uv (in order)
-
-        attrib_names = ["position", "normal", "texCoord"]  # these names are needed for proper readback
-        attrib_sizes = []
-        attrib_offsets = []
-        vertex_size = 0
-        vertex_fmt = "<"
-        for i in range(3):
-            num_components = len(vertices[0][i])
-            attrib_sizes.append(4 * num_components)
-            attrib_offsets.append(vertex_size)
-            vertex_size += attrib_sizes[i]
-            vertex_fmt += str(num_components) + "f"
-            
-        for i in range(3):
-            name = attrib_names[i]
+        for i in range(len(attrib_infos)):
+            (name, _, _) = attrib_infos[i]
             f.write(c_str(name))
             attribute = (
-                0,  # float
-                len(vertices[0][i]),
-                attrib_offsets[i],
-                vertex_size)
+                attrib_sizes[i],
+                attrib_offsets[i])
             f.write(struct.pack(attrib_fmt, *attribute))
             
         # write vertex buffer
-        for vertex in vertices:
-            components = []
-            for element in vertex:
-                components += list(element)
-            f.write(struct.pack(vertex_fmt, *components))
+        for i in range(num_vertices):
+            for (_, format, elements) in attrib_infos:
+                f.write(struct.pack(format, *(elements[i])))
             
         # write index buffer
         f.write(struct.pack("<" + str(len(tri_inds)) + "I", *tri_inds))
     
     return {'FINISHED'}
 
-def export_scene(context, filename):
-    return export_mesh(context.object, filename)
+def export_scene(context, filename, export_skinning_data):
+    return export_mesh(context.object, filename, export_skinning_data)
 
 # ExportHelper is a helper class, defines filename and
 # invoke() function which calls the file selector.
@@ -219,10 +253,10 @@ class CustomMeshExport(Operator, ExportHelper):
 
     # List of operator properties, the attributes will be assigned
     # to the class instance from the operator settings before calling.
-    use_setting: BoolProperty(
-        name="Example Boolean",
-        description="Example Tooltip",
-        default=True,
+    export_skinning_data: BoolProperty(
+        name="Export skinning data",
+        description="Export skinning data",
+        default=False,
     )
 
     type: EnumProperty(
@@ -236,7 +270,7 @@ class CustomMeshExport(Operator, ExportHelper):
     )
 
     def execute(self, context):
-        return export_scene(context, self.filepath)
+        return export_scene(context, self.filepath, self.export_skinning_data)
 
 
 # Only needed if you want to add into a dynamic menu
@@ -258,4 +292,4 @@ if __name__ == "__main__":
     register()
 
     # test call
-    bpy.ops.export_test.some_data('INVOKE_DEFAULT')
+    bpy.ops.vkcbu.export_mbin('INVOKE_DEFAULT')
