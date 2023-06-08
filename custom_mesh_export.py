@@ -1,20 +1,10 @@
-from functools import reduce
 import bpy
 import struct
+from bpy_extras.io_utils import ExportHelper
 from mathutils import Vector
 
-# Header format string
-# https://docs.python.org/3.5/library/struct.html#struct.pack
-# < : little-endian byte order, standard type sizes and no padding
-# 8s : 8-character formatted string (encoded ascii in this case) : "meshfile"
-# B : unsigned char : number of attributes
-# 3I : 3 uint32_t : vertex size, vertex count, index count
-header_fmt = "<8sB3I"
-
-attrib_fmt = "<2I"
-
-def c_str(s, encoding = "ascii"):
-    return struct.pack("<" + str(len(s) + 1) + "s", s.encode(encoding))
+def c_str(s):
+    return struct.pack("<" + str(len(s) + 1) + "s", s.encode("utf-8"))
 
 # find all the uv coords used by each vertex, and which loops use which uvs
 # return a tuple of lists
@@ -110,35 +100,21 @@ def find_vertex_permutations(mesh, loop_uv_inds, loop_normal_inds):
 
 
 def export_mesh(object, filename, export_skinning_data):
-    print("Exporting mesh to: " + filename)
     mesh = object.data
     with open(filename, "wb") as f:
-        # number of attributes, vertices, and indices must be computed
-        # blender mesh data does not 1-1 represent the sort of data we need
-        # so there are some decoding steps we need to take
-        
-        # check for uvs, todo: allow an option to enable/disable uv exporting,
-        # as well as choosing a particular uv layer for export
+        # TODO: allow an option to enable/disable uv exporting as well as choosing a particular uv layer for export
         uv_layer = mesh.uv_layers[0] if mesh.uv_layers else None
         
-        # for now lets just assume we are writing texcoords, positions, and normals
-        
-        # calculate triangulation
         if not mesh.loop_triangles:
             mesh.calc_loop_triangles()
 
-        # get all info needed to write vertex permutations
-        # permutations of position, normal, and uv per mesh vertex that is
-        # each needs to be exported as a separate vertex, but we still don't want duplicates
-        # so we do some computation
+        # find all permutations of uvs and normals that are used in the mesh per vertex and only write those
         (vertex_uvs, loop_uv_inds) = map_vertex_uvs(mesh, uv_layer)
         (vertex_normals, loop_normal_inds) = map_vertex_normals(mesh)
         (vertex_perms, loop_inds, num_vertices) = find_vertex_permutations(mesh, loop_uv_inds, loop_normal_inds)
 
         # get the loop indices in the proper number and order for triangulation
-        # iterate over each triangle and get the permutation index of each loop
-        # concatenating the lists as we go
-        tri_inds = reduce(list.__add__, [[loop_inds[i] for i in tri.loops] for tri in mesh.loop_triangles], [])
+        tri_inds = [loop_inds[i] for tri in mesh.loop_triangles for i in tri.loops]
 
         # compute the actual vertex permutations using the indices we computed
         positions = [None] * num_vertices
@@ -146,6 +122,11 @@ def export_mesh(object, filename, export_skinning_data):
         uvs = [None] * num_vertices
         joint_weights = [None] * num_vertices if export_skinning_data else []
         joint_indices = [None] * num_vertices if export_skinning_data else []
+        
+        armature = object.find_armature()
+        group_indices = [i for i in range(len(armature.data.bones)) for group in object.vertex_groups
+            if group.name == armature.data.bones[i].name] if armature else [group.index for group in object.vertex_groups]
+        
         for (vert, perms) in zip(mesh.vertices, vertex_perms):
             if export_skinning_data:
                 joint_inds = [0, 0, 0, 0]
@@ -153,13 +134,13 @@ def export_mesh(object, filename, export_skinning_data):
                 num_joints = 0
                 for group in vert.groups:
                     if num_joints < 4:
-                        joint_inds[num_joints] = group.group
+                        joint_inds[num_joints] = group_indices[group.group]
                         weights[num_joints] = group.weight
                         num_joints += 1
                     else:
                         for i in range(num_joints):
                             if weights[i] < group.weight:
-                                joint_inds[i] = group.group
+                                joint_inds[i] = group_indices[group.group]
                                 weights[i] = group.weight
                                 break
                 weight_sum = 0
@@ -182,12 +163,14 @@ def export_mesh(object, filename, export_skinning_data):
         attrib_infos = [
             ("position", "<3f", positions),
             ("normal", "<3f", normals),
-            ("texCoord", "<2f", uvs)]
+            ("texCoord", "<2f", uvs)
+        ]
         
         if export_skinning_data:
             attrib_infos += [
                 ("jointWeights", "<4f", joint_weights),
-                ("jointIndices", "<4B", joint_indices)]
+                ("jointIndices", "<4B", joint_indices)
+            ]
                 
         attrib_sizes = []
         attrib_offsets = []
@@ -198,26 +181,15 @@ def export_mesh(object, filename, export_skinning_data):
             vertex_size += attrib_sizes[-1]
         
         # write header
-        header = (
-            "meshfile".encode("ascii"),
-            len(attrib_infos),
-            vertex_size,
-            num_vertices, 
-            len(tri_inds))
+        f.write(struct.pack("<8sB3I", "meshfile".encode("utf-8"), len(attrib_infos), vertex_size, num_vertices,  len(tri_inds)))
             
-        f.write(struct.pack(header_fmt, *header))
-            
-        # write attributes
-        # interleaved as position, normal, uv (in order)
+        # write attribute info
         for i in range(len(attrib_infos)):
             (name, _, _) = attrib_infos[i]
             f.write(c_str(name))
-            attribute = (
-                attrib_sizes[i],
-                attrib_offsets[i])
-            f.write(struct.pack(attrib_fmt, *attribute))
+            f.write(struct.pack("<2I", attrib_sizes[i], attrib_offsets[i]))
             
-        # write vertex buffer
+        # write vertex attributes interleaved
         for i in range(num_vertices):
             for (_, format, elements) in attrib_infos:
                 f.write(struct.pack(format, *(elements[i])))
@@ -230,66 +202,36 @@ def export_mesh(object, filename, export_skinning_data):
 def export_scene(context, filename, export_skinning_data):
     return export_mesh(context.object, filename, export_skinning_data)
 
-# ExportHelper is a helper class, defines filename and
-# invoke() function which calls the file selector.
-from bpy_extras.io_utils import ExportHelper
-from bpy.props import StringProperty, BoolProperty, EnumProperty
-from bpy.types import Operator
-
-
-class CustomMeshExport(Operator, ExportHelper):
-    """Export to .mbin"""
-    bl_idname = "vkcbu.export_mbin"
-    bl_label = "Export binary .mbin"
+class CustomMeshExport(bpy.types.Operator, ExportHelper):
+    """Export mesh to custom binary file"""
+    bl_idname = "vkcbu.export_mesh"
+    bl_label = "Export Mesh"
 
     # ExportHelper mixin class uses this
-    filename_ext = ".mbin"
+    filename_ext = ".bin"
 
-    filter_glob: StringProperty(
-        default="*.mbin",
+    filter_glob: bpy.props.StringProperty(
+        default="*.bin",
         options={'HIDDEN'},
         maxlen=255,  # Max internal buffer length, longer would be clamped.
     )
 
     # List of operator properties, the attributes will be assigned
     # to the class instance from the operator settings before calling.
-    export_skinning_data: BoolProperty(
-        name="Export skinning data",
-        description="Export skinning data",
+    export_skinning_data: bpy.props.BoolProperty(
+        name="Export Skinning Data",
+        description="Export joint weight and indices, based on current armature",
         default=False,
-    )
-
-    type: EnumProperty(
-        name="Example Enum",
-        description="Choose between two items",
-        items=(
-            ('OPT_A', "First Option", "Description one"),
-            ('OPT_B', "Second Option", "Description two"),
-        ),
-        default='OPT_A',
     )
 
     def execute(self, context):
         return export_scene(context, self.filepath, self.export_skinning_data)
 
-
-# Only needed if you want to add into a dynamic menu
-def menu_func_export(self, context):
-    self.layout.operator(CustomMeshExport.bl_idname, text="Export binary .mbin")
-
-# Register and add to the "file selector" menu (required to use F3 search "Text Export Operator" for quick access)
 def register():
     bpy.utils.register_class(CustomMeshExport)
-    bpy.types.TOPBAR_MT_file_export.append(menu_func_export)
-
 
 def unregister():
     bpy.utils.unregister_class(CustomMeshExport)
-    bpy.types.TOPBAR_MT_file_export.remove(menu_func_export)
-
 
 if __name__ == "__main__":
     register()
-
-    # test call
-    bpy.ops.vkcbu.export_mbin('INVOKE_DEFAULT')
